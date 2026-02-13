@@ -6,6 +6,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import cv2  # type: ignore
 import numpy as np  # type: ignore
 import torch  # type: ignore
 from PIL import Image as PILImage  # type: ignore
@@ -48,6 +49,11 @@ CLINICAL_LABELS = {
 }
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
 
+# --- Optimization Configuration ---
+USE_CLAHE = True
+BEST_THRESHOLD = 0.5
+THRESHOLD_PATH = PROJECT_DIR / "best_threshold.pkl"
+
 
 def get_device() -> torch.device:
     if torch.cuda.is_available():
@@ -55,6 +61,16 @@ def get_device() -> torch.device:
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def apply_clahe(image):
+    """Apply CLAHE preprocessing: grayscale → CLAHE → 3-channel."""
+    img_array = np.array(image)
+    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    enhanced_3ch = cv2.merge([enhanced, enhanced, enhanced])
+    return PILImage.fromarray(enhanced_3ch)
 
 
 def load_backbone(device: torch.device) -> torch.nn.Module:
@@ -91,8 +107,10 @@ def preprocess_image(
         print(f"[ERROR] Image not found: {image_path}")
         sys.exit(1)
     image = PILImage.open(image_path).convert("RGB")
+    if USE_CLAHE:
+        image = apply_clahe(image)
     tensor = transform(image).unsqueeze(0).to(device)
-    print(f"[INFO] Image preprocessed: {image_path.name}")
+    print(f"[INFO] Image preprocessed: {image_path.name} (CLAHE={'ON' if USE_CLAHE else 'OFF'})")
     return tensor
 
 
@@ -102,10 +120,11 @@ def extract_features(model: torch.nn.Module, tensor: torch.Tensor) -> np.ndarray
     return features.cpu().numpy()
 
 
-def predict_with_svm(clf, features: np.ndarray) -> tuple[int, str, str, float, str]:
-    predicted_class = int(clf.predict(features)[0])
+def predict_with_svm(clf, features: np.ndarray, threshold: float | None = None) -> tuple[int, str, str, float, str]:
     probabilities = clf.predict_proba(features)[0]
     cancer_prob = float(probabilities[1])
+    t = threshold if threshold is not None else BEST_THRESHOLD
+    predicted_class = 1 if cancer_prob >= t else 0
 
     class_name = CLASS_NAMES[predicted_class]
     clinical_label = CLINICAL_LABELS[predicted_class]
@@ -160,6 +179,8 @@ def load_dataset_features(
     for img_path, label in tqdm(image_paths, desc=f"  {split_name}", unit="img"):
         try:
             image = PILImage.open(img_path).convert("RGB")
+            if USE_CLAHE:
+                image = apply_clahe(image)
             tensor = transform(image).unsqueeze(0).to(device)
         except Exception as exc:
             print(f"[WARN] Skipping corrupt image {img_path.name}: {exc}")
@@ -201,6 +222,74 @@ def save_model(clf: SVC, path: Path) -> None:
     with open(path, "wb") as f:
         pickle.dump(clf, f)
     print(f"[INFO] Model saved to {path.name}")
+
+
+def tune_threshold(
+    clf: SVC, X_val: np.ndarray, y_val: np.ndarray
+) -> tuple[float, float, float, float, float, float]:
+    """Sweep thresholds on validation set and select optimal one."""
+    global BEST_THRESHOLD
+
+    probs = clf.predict_proba(X_val)[:, 1]  # P(CANCER)
+
+    # --- Default 0.5 accuracy ---
+    y_pred_default = (probs >= 0.5).astype(int)
+    default_acc = float(accuracy_score(y_val, y_pred_default))
+
+    thresholds = np.arange(0.30, 0.91, 0.05)
+
+    print("\n" + "=" * 62)
+    print("THRESHOLD TUNING \u2014 Validation Set")
+    print("=" * 62)
+    print(f"{'Threshold':>10} | {'Sensitivity':>12} | {'Specificity':>12} | {'Balanced Acc':>14}")
+    print("-" * 62)
+
+    results: list[tuple[float, float, float, float]] = []
+
+    for t in thresholds:
+        y_pred_t = (probs >= t).astype(int)
+        cm = confusion_matrix(y_val, y_pred_t, labels=[0, 1])
+        tn, fp, fn, tp = cm.ravel()
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        bal_acc = (sensitivity + specificity) / 2.0
+        results.append((float(t), sensitivity, specificity, bal_acc))
+        print(f"{t:>10.2f} | {sensitivity:>11.4f} | {specificity:>11.4f} | {bal_acc:>13.4f}")
+
+    # Select: sensitivity >= 0.95, then highest balanced accuracy
+    eligible = [(t, se, sp, ba) for t, se, sp, ba in results if se >= 0.95]
+    if eligible:
+        best = max(eligible, key=lambda x: x[3])
+    else:
+        # Fallback: pick highest sensitivity, break ties by balanced accuracy
+        best = max(results, key=lambda x: (x[1], x[3]))
+        print("[WARN] No threshold reached 95% sensitivity — selecting highest sensitivity.")
+
+    best_thresh, best_sens, best_spec, best_bal_acc = best
+    BEST_THRESHOLD = best_thresh
+
+    # Save threshold to disk
+    with open(THRESHOLD_PATH, "wb") as f:
+        pickle.dump(BEST_THRESHOLD, f)
+    print(f"[INFO] Threshold saved to {THRESHOLD_PATH.name}")
+
+    # Optimized accuracy
+    y_pred_opt = (probs >= BEST_THRESHOLD).astype(int)
+    opt_acc = float(accuracy_score(y_val, y_pred_opt))
+
+    print("-" * 62)
+    print(f"""
+--------------------------------------
+THRESHOLD TUNING COMPLETE
+--------------------------------------
+Selected Threshold: {BEST_THRESHOLD:.2f}
+Sensitivity: {best_sens:.4f}
+Specificity: {best_spec:.4f}
+Balanced Accuracy: {best_bal_acc:.4f}
+--------------------------------------
+""")
+
+    return BEST_THRESHOLD, best_sens, best_spec, best_bal_acc, default_acc, opt_acc
 
 
 def print_training_summary(
@@ -250,6 +339,7 @@ READY FOR PHASE 4 (Lung Cancer Inference + Grad-CAM)
 def run_training() -> None:
     device = get_device()
     print(f"[INFO] PyTorch {torch.__version__} | Device: {device}")
+    print(f"[INFO] CLAHE Preprocessing: {'ENABLED' if USE_CLAHE else 'DISABLED'}")
 
     model = load_backbone(device)
     transform = get_transform()
@@ -265,6 +355,31 @@ def run_training() -> None:
     save_model(clf, SVM_MODEL_PATH)
 
     print_training_summary(len(y_train), len(y_val), train_time, accuracy, cm, report)
+
+    # --- Threshold Tuning ---
+    threshold, sensitivity, specificity, bal_acc, default_acc, opt_acc = tune_threshold(
+        clf, X_val, y_val
+    )
+
+    # --- Final Optimization Summary ---
+    print(f"""
+------------------------------------------
+MODEL OPTIMIZATION COMPLETE
+------------------------------------------
+
+Validation Accuracy (default 0.5): {default_acc * 100:.2f} %
+Validation Accuracy (optimized threshold): {opt_acc * 100:.2f} %
+
+Cancer Recall (optimized): {sensitivity * 100:.2f} %
+Normal Recall (optimized): {specificity * 100:.2f} %
+
+Selected Threshold: {threshold:.2f}
+CLAHE Enabled: {USE_CLAHE}
+
+System Status:
+OPTIMIZED FOR REVIEW
+
+------------------------------------------""")
 
 
 def generate_gradcam(image_path: Path) -> str:
@@ -525,6 +640,8 @@ FULL LUNG CANCER PIPELINE COMPLETE
 
 
 def run_inference() -> None:
+    global BEST_THRESHOLD
+
     raw_path = input("Enter path to CT scan image: ").strip()
     image_path = Path(raw_path).expanduser().resolve()
     if not image_path.exists():
@@ -533,6 +650,14 @@ def run_inference() -> None:
 
     device = get_device()
     print(f"[INFO] PyTorch {torch.__version__} | Device: {device}")
+
+    # Load optimized threshold if available
+    if THRESHOLD_PATH.exists():
+        with open(THRESHOLD_PATH, "rb") as f:
+            BEST_THRESHOLD = pickle.load(f)
+        print(f"[INFO] Loaded optimized threshold: {BEST_THRESHOLD:.2f}")
+    else:
+        print(f"[WARN] No optimized threshold found \u2014 using default {BEST_THRESHOLD:.2f}")
 
     backbone = load_backbone(device)
     clf = load_svm_model(SVM_MODEL_PATH)
@@ -543,7 +668,9 @@ def run_inference() -> None:
     features = extract_features(backbone, tensor)
     print(f"[INFO] Feature vector shape: {features.shape}")
 
-    pred_idx, class_name, clinical_label, cancer_prob, risk_level = predict_with_svm(clf, features)
+    pred_idx, class_name, clinical_label, cancer_prob, risk_level = predict_with_svm(
+        clf, features, threshold=BEST_THRESHOLD
+    )
 
     generate_gradcam(image_path)
 
