@@ -1,20 +1,21 @@
-"""lung_project — Phase 5: Inference + Grad-CAM + PDF report generation."""
+"""lung_project — Lung Cancer Detection: Training + Inference + Grad-CAM + PDF."""
 
 import pickle
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np # type: ignore
-import torch # type: ignore
-from PIL import Image as PILImage # type: ignore
-from pytorch_grad_cam import GradCAM # type: ignore
-from pytorch_grad_cam.utils.image import show_cam_on_image # pyright: ignore[reportMissingImports]
-from reportlab.lib import colors # type: ignore
-from reportlab.lib.pagesizes import A4 # type: ignore
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet # type: ignore
-from reportlab.lib.units import inch, mm # type: ignore
-from reportlab.platypus import ( # type: ignore
+import numpy as np  # type: ignore
+import torch  # type: ignore
+from PIL import Image as PILImage  # type: ignore
+from pytorch_grad_cam import GradCAM  # type: ignore
+from pytorch_grad_cam.utils.image import show_cam_on_image  # pyright: ignore[reportMissingImports]
+from reportlab.lib import colors  # type: ignore
+from reportlab.lib.pagesizes import A4  # type: ignore
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet  # type: ignore
+from reportlab.lib.units import inch, mm  # type: ignore
+from reportlab.platypus import (  # type: ignore
     Image,
     Paragraph,
     SimpleDocTemplate,
@@ -22,17 +23,30 @@ from reportlab.platypus import ( # type: ignore
     Table,
     TableStyle,
 )
-from torchvision import transforms # type: ignore
-from torchvision.models import EfficientNet_B0_Weights, efficientnet_b0 # type: ignore
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix  # type: ignore
+from sklearn.svm import SVC  # type: ignore
+from torchvision import transforms  # type: ignore
+from torchvision.models import EfficientNet_B0_Weights, efficientnet_b0  # type: ignore
+from tqdm import tqdm  # type: ignore
 
 PROJECT_DIR = Path(__file__).parent
 SVM_MODEL_PATH = PROJECT_DIR / "svm_model.pkl"
 GRADCAM_OUTPUT_PATH = PROJECT_DIR / "gradcam_output.jpg"
 REPORT_PATH = PROJECT_DIR / "final_report.pdf"
 
+DATASET_DIR = PROJECT_DIR / "dataset"
+TRAIN_DIR = DATASET_DIR / "train"
+VAL_DIR = DATASET_DIR / "val"
+
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
-CLASS_NAMES = {0: "NORMAL", 1: "PNEUMONIA"}
+LABEL_MAP = {"NORMAL": 0, "CANCER": 1}
+CLASS_NAMES = {0: "NORMAL", 1: "CANCER"}
+CLINICAL_LABELS = {
+    0: "No Suspicious Lung Malignancy Detected",
+    1: "Suspicious Lung Malignancy Detected",
+}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
 
 
 def get_device() -> torch.device:
@@ -88,22 +102,169 @@ def extract_features(model: torch.nn.Module, tensor: torch.Tensor) -> np.ndarray
     return features.cpu().numpy()
 
 
-def predict_with_svm(clf, features: np.ndarray) -> tuple[str, float, str]:
+def predict_with_svm(clf, features: np.ndarray) -> tuple[int, str, str, float, str]:
     predicted_class = int(clf.predict(features)[0])
     probabilities = clf.predict_proba(features)[0]
-    pneumonia_prob = float(probabilities[1])
+    cancer_prob = float(probabilities[1])
 
     class_name = CLASS_NAMES[predicted_class]
+    clinical_label = CLINICAL_LABELS[predicted_class]
 
-    if pneumonia_prob < 0.30:
+    if cancer_prob < 0.30:
         risk_level = "LOW"
-    elif pneumonia_prob <= 0.70:
+    elif cancer_prob <= 0.70:
         risk_level = "MODERATE"
     else:
         risk_level = "HIGH"
 
-    print(f"[INFO] Prediction: {class_name} | Confidence: {pneumonia_prob * 100:.2f}% | Risk: {risk_level}")
-    return class_name, pneumonia_prob, risk_level
+    print(f"[INFO] Prediction: {clinical_label}")
+    print(f"[INFO] Probability of Cancer: {cancer_prob * 100:.2f}% | Risk Category: {risk_level}")
+    return predicted_class, class_name, clinical_label, cancer_prob, risk_level
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — SVM Training
+# ---------------------------------------------------------------------------
+
+
+def load_dataset_features(
+    data_dir: Path,
+    model: torch.nn.Module,
+    transform: transforms.Compose,
+    device: torch.device,
+    split_name: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    features_list: list[np.ndarray] = []
+    labels_list: list[int] = []
+    skipped = 0
+    class_counts: dict[str, int] = {}
+
+    image_paths: list[tuple[Path, int]] = []
+    for class_name, label in LABEL_MAP.items():
+        class_dir = data_dir / class_name
+        if not class_dir.is_dir():
+            print(f"[WARN] Directory not found: {class_dir}")
+            continue
+        count = 0
+        for img_path in sorted(class_dir.iterdir()):
+            if img_path.suffix.lower() in IMAGE_EXTENSIONS:
+                image_paths.append((img_path, label))
+                count += 1
+        class_counts[class_name] = count
+
+    for cls, cnt in class_counts.items():
+        print(f"[INFO] {split_name}/{cls}: {cnt} images")
+
+    print(f"[INFO] Extracting features from {split_name} ({len(image_paths)} images)...")
+
+    for img_path, label in tqdm(image_paths, desc=f"  {split_name}", unit="img"):
+        try:
+            image = PILImage.open(img_path).convert("RGB")
+            tensor = transform(image).unsqueeze(0).to(device)
+        except Exception as exc:
+            print(f"[WARN] Skipping corrupt image {img_path.name}: {exc}")
+            skipped += 1
+            continue
+        feat = extract_features(model, tensor).flatten()
+        features_list.append(feat)
+        labels_list.append(label)
+
+    if skipped > 0:
+        print(f"[WARN] Skipped {skipped} corrupt images in {split_name}.")
+
+    X = np.array(features_list)
+    y = np.array(labels_list)
+    print(f"[INFO] {split_name} features shape: {X.shape}")
+    return X, y
+
+
+def train_svm(X_train: np.ndarray, y_train: np.ndarray) -> SVC:
+    print("[INFO] Training SVM (kernel=rbf, class_weight=balanced)...")
+    clf = SVC(kernel="rbf", probability=True, class_weight="balanced")
+    clf.fit(X_train, y_train)
+    print("[INFO] SVM training complete.")
+    return clf
+
+
+def evaluate_model(
+    clf: SVC, X_val: np.ndarray, y_val: np.ndarray
+) -> tuple[float, np.ndarray, str]:
+    print("[INFO] Evaluating on validation set...")
+    y_pred = clf.predict(X_val)
+    acc = accuracy_score(y_val, y_pred)
+    cm = confusion_matrix(y_val, y_pred)
+    report = classification_report(y_val, y_pred, target_names=["NORMAL", "CANCER"])
+    return acc, cm, report
+
+
+def save_model(clf: SVC, path: Path) -> None:
+    with open(path, "wb") as f:
+        pickle.dump(clf, f)
+    print(f"[INFO] Model saved to {path.name}")
+
+
+def print_training_summary(
+    n_train: int,
+    n_val: int,
+    train_time: float,
+    accuracy: float,
+    cm: np.ndarray,
+    report: str,
+) -> None:
+    print(
+        f"""
+------------------------------------------
+LUNG CANCER SVM TRAINING COMPLETED
+------------------------------------------
+
+Dataset: Lung Cancer CT Dataset
+Classes:
+    NORMAL → 0
+    CANCER → 1
+
+Training Samples: {n_train}
+Validation Samples: {n_val}
+Feature Vector Size: 1280
+
+SVM Configuration:
+    Kernel: RBF
+    Class Weight: Balanced
+    Probability Enabled: Yes
+
+Validation Accuracy: {accuracy * 100:.2f} %
+Confusion Matrix:
+{cm}
+
+Classification Report:
+{report}
+Model Saved As:
+    {SVM_MODEL_PATH.name}
+
+System Status:
+READY FOR PHASE 4 (Lung Cancer Inference + Grad-CAM)
+
+------------------------------------------"""
+    )
+
+
+def run_training() -> None:
+    device = get_device()
+    print(f"[INFO] PyTorch {torch.__version__} | Device: {device}")
+
+    model = load_backbone(device)
+    transform = get_transform()
+
+    X_train, y_train = load_dataset_features(TRAIN_DIR, model, transform, device, "train")
+    X_val, y_val = load_dataset_features(VAL_DIR, model, transform, device, "val")
+
+    t0 = time.time()
+    clf = train_svm(X_train, y_train)
+    train_time = time.time() - t0
+
+    accuracy, cm, report = evaluate_model(clf, X_val, y_val)
+    save_model(clf, SVM_MODEL_PATH)
+
+    print_training_summary(len(y_train), len(y_val), train_time, accuracy, cm, report)
 
 
 def generate_gradcam(image_path: Path) -> str:
@@ -183,10 +344,11 @@ def generate_pdf_report(
 
     def _footer(canvas, doc):
         canvas.saveState()
-        canvas.setFont("Helvetica", 8)
+        canvas.setFont("Helvetica", 7)
         canvas.setFillColor(colors.grey)
-        canvas.drawString(30 * mm, 15 * mm, "System Generated Report  |  Confidential")
-        canvas.drawRightString(A4[0] - 30 * mm, 15 * mm, f"Page {doc.page}")
+        canvas.drawString(25 * mm, 15 * mm, "AI-Based Lung Cancer Detection System")
+        canvas.drawCentredString(A4[0] / 2, 15 * mm, "Confidential \u2013 For Academic Use Only")
+        canvas.drawRightString(A4[0] - 25 * mm, 15 * mm, f"Page {doc.page}")
         canvas.restoreState()
 
     doc = SimpleDocTemplate(
@@ -200,7 +362,7 @@ def generate_pdf_report(
 
     elements: list = []
 
-    elements.append(Paragraph("AI-Based Lung Abnormality Detection Report", title_style))
+    elements.append(Paragraph("AI-Based Lung Cancer Detection Report", title_style))
     elements.append(Spacer(1, 2))
 
     line_table = Table([[""] ], colWidths=[doc.width])
@@ -214,8 +376,9 @@ def generate_pdf_report(
     scan_data = [
         ["Input Image:", image_name],
         ["Date & Time:", timestamp],
-        ["Model Used:", "EfficientNetB0 + SVM"],
-        ["Model Version:", "v1.0"],
+        ["Model:", "EfficientNetB0 (Feature Extractor) + SVM (RBF Kernel)"],
+        ["Training Dataset:", "Lung Cancer CT Dataset"],
+        ["Model Version:", "v2.0 (Lung Cancer Edition)"],
     ]
     scan_table = Table(scan_data, colWidths=[130, 320])
     scan_table.setStyle(TableStyle([
@@ -234,11 +397,11 @@ def generate_pdf_report(
         risk_level, "#000000"
     )
     pred_data = [
-        ["Predicted Class:", predicted_class],
-        ["Probability:", f"{probability * 100:.2f} %"],
+        ["Prediction Outcome:", predicted_class],
+        ["Probability of Malignancy:", f"{probability * 100:.2f} %"],
         ["Risk Level:", risk_level],
     ]
-    pred_table = Table(pred_data, colWidths=[130, 320])
+    pred_table = Table(pred_data, colWidths=[160, 290])
     pred_table.setStyle(TableStyle([
         ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
         ("FONTNAME", (1, 0), (1, -1), "Helvetica"),
@@ -249,6 +412,25 @@ def generate_pdf_report(
         ("FONTNAME", (1, 2), (1, 2), "Helvetica-Bold"),
     ]))
     elements.append(pred_table)
+
+    if risk_level in ("MODERATE", "HIGH"):
+        interp_style = ParagraphStyle(
+            "Interpretation", parent=body_style, textColor=colors.HexColor("#8B4513"),
+            spaceBefore=6, fontSize=9, leading=12,
+        )
+        elements.append(Paragraph(
+            "If risk level is MODERATE or HIGH, further radiological evaluation is recommended.",
+            interp_style,
+        ))
+
+    # --- Model Sensitivity Notice ---
+    elements.append(Paragraph("Model Sensitivity Notice", section_style))
+    sensitivity_text = (
+        "This model is configured with high sensitivity to minimize the likelihood "
+        "of missing malignant cases. As a result, false positives may occur and "
+        "require professional clinical confirmation."
+    )
+    elements.append(Paragraph(sensitivity_text, body_style))
 
     elements.append(Paragraph("Original Scan &amp; Grad-CAM Visualization", section_style))
 
@@ -269,6 +451,10 @@ def generate_pdf_report(
         gradcam_cell = Image(str(GRADCAM_OUTPUT_PATH), width=gw * g_scale, height=gh * g_scale)
 
     label_style = ParagraphStyle("ImgLabel", parent=body_style, alignment=1, spaceBefore=4)
+    caption_style = ParagraphStyle(
+        "ImgCaption", parent=body_style, alignment=1, fontSize=8, leading=11,
+        textColor=colors.HexColor("#444444"),
+    )
     img_table = Table(
         [
             [original_cell, gradcam_cell],
@@ -283,13 +469,22 @@ def generate_pdf_report(
         ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
     ]))
     elements.append(img_table)
+    elements.append(Spacer(1, 4))
+    elements.append(Paragraph(
+        "Grad-CAM heatmap highlighting regions that most influenced the CNN feature extraction stage.",
+        caption_style,
+    ))
+    elements.append(Paragraph(
+        "This visualization reflects spatial attention of the CNN backbone and does not represent the SVM decision boundary.",
+        caption_style,
+    ))
     elements.append(Spacer(1, 10))
 
     elements.append(Paragraph("Medical Disclaimer", section_style))
     disclaimer_text = (
-        "This AI-generated report is intended for educational and research purposes only. "
-        "It is NOT a substitute for professional medical diagnosis. "
-        "Please consult a certified radiologist or healthcare provider for clinical decisions."
+        "This AI-generated report is intended strictly for educational and research purposes. "
+        "It is NOT a substitute for professional medical diagnosis, treatment, or clinical decision-making. "
+        "All predictions must be reviewed and validated by a certified radiologist or healthcare professional."
     )
     elements.append(Paragraph(disclaimer_text, disclaimer_style))
 
@@ -298,34 +493,39 @@ def generate_pdf_report(
     return timestamp
 
 
-def print_summary(
-    predicted_class: str,
+def print_inference_summary(
+    image_path: Path,
+    clinical_label: str,
     probability: float,
     risk_level: str,
+    device: torch.device,
     timestamp: str,
 ) -> None:
     print(
         f"""
-------------------------------------------
-PHASE 5 COMPLETED SUCCESSFULLY
-------------------------------------------
+----------------------------------------------
+LUNG CANCER PDF REPORT GENERATED
+----------------------------------------------
 
 Report File: {REPORT_PATH.name}
-Prediction: {predicted_class}
+Prediction: {clinical_label}
 Probability: {probability * 100:.2f} %
 Risk Level: {risk_level}
-Grad-CAM Included: Yes
+
+Report Version: Lung Cancer Edition (v2.0)
+Disclaimer Included: Yes
+Grad-CAM Embedded: Yes
 Timestamp: {timestamp}
 
 System Status:
-FULL PIPELINE COMPLETE
+FULL LUNG CANCER PIPELINE COMPLETE
 
-------------------------------------------"""
+----------------------------------------------"""
     )
 
 
-def main() -> None:
-    raw_path = input("Enter path to chest X-ray image: ").strip()
+def run_inference() -> None:
+    raw_path = input("Enter path to CT scan image: ").strip()
     image_path = Path(raw_path).expanduser().resolve()
     if not image_path.exists():
         print(f"[ERROR] Image not found: {image_path}")
@@ -343,13 +543,20 @@ def main() -> None:
     features = extract_features(backbone, tensor)
     print(f"[INFO] Feature vector shape: {features.shape}")
 
-    class_name, pneumonia_prob, risk_level = predict_with_svm(clf, features)
+    pred_idx, class_name, clinical_label, cancer_prob, risk_level = predict_with_svm(clf, features)
 
     generate_gradcam(image_path)
 
-    timestamp = generate_pdf_report(image_path.name, class_name, pneumonia_prob, risk_level, image_path)
+    timestamp = generate_pdf_report(image_path.name, clinical_label, cancer_prob, risk_level, image_path)
 
-    print_summary(class_name, pneumonia_prob, risk_level, timestamp)
+    print_inference_summary(image_path, clinical_label, cancer_prob, risk_level, device, timestamp)
+
+
+def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "--train":
+        run_training()
+    else:
+        run_inference()
 
 
 if __name__ == "__main__":
